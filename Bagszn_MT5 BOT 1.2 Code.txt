@@ -1,0 +1,700 @@
+//+------------------------------------------------------------------+
+//|                                                       Bagszn.mq5 |
+//|                        Copyright 2023, MetaQuotes Software Corp. |
+//|                                             https://www.meta.com |
+//+------------------------------------------------------------------+
+#property copyright "Copyright 2023, MetaQuotes Software Corp."
+#property link      "https://www.meta.com"
+#property version   "1.01"
+
+#include <Trade\Trade.mqh>
+#include <Indicators\Trend.mqh>
+#include <Indicators\Oscilators.mqh>
+#include <Indicators\Volumes.mqh>
+
+//+------------------------------------------------------------------+
+//| Input parameters                                                 |
+//+------------------------------------------------------------------+
+input double   RiskPercent = 1.0;           // Risk percentage per trade
+input int      ATRPeriod = 14;              // ATR period for volatility
+input double   TPSLRatio = 10.0;            // TP:SL ratio (1:10)
+input double   TestSLMultiplier = 2.0;      // SL multiplier for test positions (ATR * X)
+input double   TestTPMultiplier = 4.0;      // TP multiplier for test positions (ATR * X)
+input bool     EnableTrailingSL = true;     // Enable trailing stop loss
+input double   TrailingSL_ATR_Mult = 1.5;   // Trailing SL multiplier for test positions (ATR * X)
+input double   TestPositionSize = 0.01;     // Size for test positions
+input int      MaxPositions = 100;          // Maximum concurrent positions
+input bool     UseRegimeFilter = true;      // Use trend/range detection
+input int      RSI_Period = 14;             // RSI period for confirmation
+input double   RSI_Overbought = 70;         // RSI overbought level
+input double   RSI_Oversold = 30;           // RSI oversold level
+input int      MACD_Fast = 12;              // MACD fast EMA
+input int      MACD_Slow = 26;              // MACD slow EMA
+input int      MACD_Signal = 9;             // MACD signal SMA
+
+//+------------------------------------------------------------------+
+//| Virtual test structure for endless virtual testing               |
+//+------------------------------------------------------------------+
+struct VirtualTestPosition
+{
+   bool active;
+   ENUM_POSITION_TYPE type;
+   double entryPrice;
+   double sl;
+   double tp;
+   double trailSL;
+   datetime openTime;
+};
+
+//+------------------------------------------------------------------+
+//| Global variables                                                 |
+//+------------------------------------------------------------------+
+CTrade         trade;
+double         atrValue;
+int            trendDirection = 0;
+bool           inTestPhase = false;
+ulong          testLongTicket = 0;
+ulong          testShortTicket = 0;
+ulong          committedTicket = 0;
+datetime       positionOpenTime = 0;
+bool           positionInProfit = false;
+int            currentPositions = 0;
+double         rsiValue;
+double         macdValue;
+double         macdSignal;
+int            handleATR;
+int            handleRSI;
+int            handleMACD;
+MqlTick        lastTick;
+
+//--- Virtual test for the current symbol
+VirtualTestPosition virtualTest;
+bool virtualTestPassed = false;
+ENUM_POSITION_TYPE virtualTestPassedType;
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   // Initialize indicators
+   handleATR = iATR(_Symbol, _Period, ATRPeriod);
+   handleRSI = iRSI(_Symbol, _Period, RSI_Period, PRICE_CLOSE);
+   handleMACD = iMACD(_Symbol, _Period, MACD_Fast, MACD_Slow, MACD_Signal, PRICE_CLOSE);
+   
+   if(handleATR == INVALID_HANDLE || handleRSI == INVALID_HANDLE || handleMACD == INVALID_HANDLE)
+   {
+      Print("Error creating indicators");
+      return(INIT_FAILED);
+   }
+   
+   // Set magic number for EA
+   trade.SetExpertMagicNumber(12345);
+   
+   // Check if we have existing positions
+   CheckExistingPositions();
+   
+   // Virtual test init
+   virtualTest.active = false;
+   virtualTestPassed = false;
+
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   // Clean up indicators
+   IndicatorRelease(handleATR);
+   IndicatorRelease(handleRSI);
+   IndicatorRelease(handleMACD);
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   // Get current tick data
+   if(!SymbolInfoTick(_Symbol, lastTick))
+   {
+      Print("Error getting tick data");
+      return;
+   }
+   
+   // Update indicators
+   UpdateIndicators();
+   
+   // Calculate market conditions
+   CalculateATR();
+   DetectRegime();
+   
+   // --- BEGIN VIRTUAL TEST LOOP ---
+   // Only run virtual test if we are not in a real test phase or committed position
+   if(!inTestPhase && committedTicket == 0 && !virtualTestPassed)
+   {
+      RunVirtualTest();
+      return; // Don't do anything else until virtual test passes
+   }
+
+   // --- If virtual test passed, open real test positions as before ---
+   if(virtualTestPassed && !inTestPhase && committedTicket == 0)
+   {
+      StartRealTestPosition(virtualTestPassedType);
+      virtualTestPassed = false; // reset for next round
+      virtualTest.active = false;
+      return;
+   }
+   
+   // Manage existing positions
+   ManagePositions();
+   
+   // Entry logic (no longer called here)
+   // if(ShouldEnterMarket()) { EnterMarket(); }
+   
+   // Trailing SL for test positions
+   if(inTestPhase)
+   {
+      ManageTestTrailingSL();
+   }
+}
+
+//+------------------------------------------------------------------+
+//| --- VIRTUAL TEST LOGIC: simulate until success                  |
+//+------------------------------------------------------------------+
+void RunVirtualTest()
+{
+   // If not active, (re)start the virtual test according to entry logic
+   if(!virtualTest.active)
+   {
+      ENUM_POSITION_TYPE vtype;
+      if(!ShouldEnterMarket())
+         return;
+      // Use your regime logic to decide direction
+      if(trendDirection > 0)
+         vtype = POSITION_TYPE_BUY;
+      else if(trendDirection < 0)
+         vtype = POSITION_TYPE_SELL;
+      else
+      {
+         // Ranging: pick both, but here just alternate or pick one. For simplicity, pick BUY if RSI < oversold, else SELL.
+         vtype = (rsiValue < RSI_Oversold) ? POSITION_TYPE_BUY : POSITION_TYPE_SELL;
+      }
+      double entry = (vtype == POSITION_TYPE_BUY) ? lastTick.ask : lastTick.bid;
+      virtualTest.active = true;
+      virtualTest.type = vtype;
+      virtualTest.entryPrice = entry;
+      virtualTest.sl = (vtype == POSITION_TYPE_BUY) ? entry - atrValue * TestSLMultiplier : entry + atrValue * TestSLMultiplier;
+      virtualTest.tp = (vtype == POSITION_TYPE_BUY) ? entry + atrValue * TestTPMultiplier : entry - atrValue * TestTPMultiplier;
+      virtualTest.trailSL = virtualTest.sl;
+      virtualTest.openTime = TimeCurrent();
+      return;
+   }
+   // Update virtual SL/TP/trailing
+   double price = (virtualTest.type == POSITION_TYPE_BUY) ? lastTick.ask : lastTick.bid;
+   // Trailing SL
+   if(EnableTrailingSL)
+   {
+      double trail = (virtualTest.type == POSITION_TYPE_BUY) ?
+         price - (atrValue * TrailingSL_ATR_Mult) :
+         price + (atrValue * TrailingSL_ATR_Mult);
+      if((virtualTest.type == POSITION_TYPE_BUY && trail > virtualTest.trailSL) ||
+         (virtualTest.type == POSITION_TYPE_SELL && trail < virtualTest.trailSL))
+         virtualTest.trailSL = trail;
+   }
+   // Check for stop loss
+   if((virtualTest.type == POSITION_TYPE_BUY && price <= virtualTest.trailSL) ||
+      (virtualTest.type == POSITION_TYPE_SELL && price >= virtualTest.trailSL))
+   {
+      // Failed - reinit
+      virtualTest.active = false;
+      return;
+   }
+   // Check for take profit
+   if((virtualTest.type == POSITION_TYPE_BUY && price >= virtualTest.tp) ||
+      (virtualTest.type == POSITION_TYPE_SELL && price <= virtualTest.tp))
+   {
+      // Success - trigger real test phase
+      virtualTestPassed = true;
+      virtualTestPassedType = virtualTest.type;
+      virtualTest.active = false;
+      Print("Virtual test successful: ", EnumToString(virtualTestPassedType));
+      return;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Open real test positions (as original EnterMarket)               |
+//+------------------------------------------------------------------+
+void StartRealTestPosition(ENUM_POSITION_TYPE type)
+{
+   // Only open one test position, in the direction of the successful virtual test
+   MqlTradeRequest req;
+   ZeroMemory(req);
+   MqlTradeResult res;
+   ZeroMemory(res);
+
+   double entry = (type == POSITION_TYPE_BUY) ? lastTick.ask : lastTick.bid;
+   double sl = (type == POSITION_TYPE_BUY) ? entry - (atrValue * TestSLMultiplier) : entry + (atrValue * TestSLMultiplier);
+   double tp = (type == POSITION_TYPE_BUY) ? entry + (atrValue * TestTPMultiplier) : entry - (atrValue * TestTPMultiplier);
+
+   req.action = TRADE_ACTION_DEAL;
+   req.symbol = _Symbol;
+   req.volume = TestPositionSize;
+   req.type = (type == POSITION_TYPE_BUY) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+   req.price = entry;
+   req.sl = sl;
+   req.tp = tp;
+   req.deviation = 10;
+   req.type_filling = ORDER_FILLING_FOK;
+   req.magic = 12345;
+
+   if(!OrderSend(req, res))
+   {
+      Print("Error opening real test position: ", GetLastError());
+      return;
+   }
+   if(res.retcode == TRADE_RETCODE_DONE)
+   {
+      if(type == POSITION_TYPE_BUY)
+      {
+         testLongTicket = res.order;
+         testShortTicket = 0;
+      }
+      else
+      {
+         testShortTicket = res.order;
+         testLongTicket = 0;
+      }
+      inTestPhase = true;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Update indicator values                                          |
+//+------------------------------------------------------------------+
+void UpdateIndicators()
+{
+   double values[2];
+   
+   // Get RSI value
+   if(CopyBuffer(handleRSI, 0, 0, 2, values) == 2)
+   {
+      rsiValue = values[1];
+   }
+   
+   // Get MACD values
+   double macdValues[2], signalValues[2];
+   if(CopyBuffer(handleMACD, 0, 0, 2, macdValues) == 2 && 
+      CopyBuffer(handleMACD, 1, 0, 2, signalValues) == 2)
+   {
+      macdValue = macdValues[1];
+      macdSignal = signalValues[1];
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Calculate ATR for volatility-based sizing                        |
+//+------------------------------------------------------------------+
+void CalculateATR()
+{
+   double values[1];
+   if(CopyBuffer(handleATR, 0, 0, 1, values) == 1)
+   {
+      atrValue = values[0];
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Detect market regime (trending/ranging)                          |
+//+------------------------------------------------------------------+
+void DetectRegime()
+{
+   // Simple trend detection using MACD
+   if(macdValue > macdSignal && macdValue > 0)
+   {
+      trendDirection = 1;  // Uptrend
+   }
+   else if(macdValue < macdSignal && macdValue < 0)
+   {
+      trendDirection = -1; // Downtrend
+   }
+   else
+   {
+      trendDirection = 0;  // Ranging
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Check for existing positions on init                             |
+//+------------------------------------------------------------------+
+void CheckExistingPositions()
+{
+   currentPositions = PositionsTotal();
+   
+   if(currentPositions > 0)
+   {
+      for(int i = 0; i < currentPositions; i++)
+      {
+         ulong ticket = PositionGetTicket(i);
+         if(PositionSelectByTicket(ticket))
+         {
+            if(PositionGetInteger(POSITION_MAGIC) == 12345)
+            {
+               // Check if this is a test position
+               double volume = PositionGetDouble(POSITION_VOLUME);
+               if(volume == TestPositionSize)
+               {
+                  if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+                  {
+                     testLongTicket = ticket;
+                  }
+                  else
+                  {
+                     testShortTicket = ticket;
+                  }
+                  inTestPhase = true;
+               }
+               else
+               {
+                  committedTicket = ticket;
+                  positionOpenTime = (datetime)PositionGetInteger(POSITION_TIME);
+               }
+            }
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Manage open positions                                            |
+//+------------------------------------------------------------------+
+void ManagePositions()
+{
+   // Check if we're in test phase
+   if(inTestPhase)
+   {
+      CheckTestPositions();
+      return;
+   }
+   
+   // Check if we have a committed position
+   if(committedTicket != 0 && PositionSelectByTicket(committedTicket))
+   {
+      double currentProfit = PositionGetDouble(POSITION_PROFIT);
+      double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      double currentPrice = PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY ? lastTick.ask : lastTick.bid;
+      
+      // Check if position is in profit
+      if(currentProfit > 0)
+      {
+         positionInProfit = true;
+         
+         // Dynamic trailing stop logic
+         if(EnableTrailingSL)
+         {
+            double newSl = PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY ? 
+                          currentPrice - (atrValue * TPSLRatio) : 
+                          currentPrice + (atrValue * TPSLRatio);
+            
+            double currentSl = PositionGetDouble(POSITION_SL);
+            
+            if((PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY && newSl > currentSl) || 
+               (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL && newSl < currentSl))
+            {
+               trade.PositionModify(committedTicket, newSl, PositionGetDouble(POSITION_TP));
+            }
+         }
+         
+         // Check if position has been held for more than 1 minute
+         if(TimeCurrent() - positionOpenTime > 60 && positionInProfit && currentPositions < MaxPositions)
+         {
+            DuplicatePosition();
+         }
+      }
+   }
+   
+   // Count current positions
+   currentPositions = PositionsTotal();
+}
+
+//+------------------------------------------------------------------+
+//| Manage trailing stop for test positions                          |
+//+------------------------------------------------------------------+
+void ManageTestTrailingSL()
+{
+   // Long test
+   if(testLongTicket != 0 && PositionSelectByTicket(testLongTicket))
+   {
+      double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      double sl = PositionGetDouble(POSITION_SL);
+      double trailSL = lastTick.ask - (atrValue * TrailingSL_ATR_Mult);
+      if(sl == 0 || trailSL > sl)
+      {
+         trade.PositionModify(testLongTicket, trailSL, PositionGetDouble(POSITION_TP));
+      }
+   }
+   // Short test
+   if(testShortTicket != 0 && PositionSelectByTicket(testShortTicket))
+   {
+      double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      double sl = PositionGetDouble(POSITION_SL);
+      double trailSL = lastTick.bid + (atrValue * TrailingSL_ATR_Mult);
+      if(sl == 0 || trailSL < sl)
+      {
+         trade.PositionModify(testShortTicket, trailSL, PositionGetDouble(POSITION_TP));
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Check test positions to determine which one to commit to         |
+//+------------------------------------------------------------------+
+void CheckTestPositions()
+{
+   bool longInProfit = false;
+   bool shortInProfit = false;
+   
+   if(testLongTicket != 0 && PositionSelectByTicket(testLongTicket))
+   {
+      longInProfit = PositionGetDouble(POSITION_PROFIT) > 0;
+   }
+   
+   if(testShortTicket != 0 && PositionSelectByTicket(testShortTicket))
+   {
+      shortInProfit = PositionGetDouble(POSITION_PROFIT) > 0;
+   }
+   
+   // Determine which test position is performing better
+   if(longInProfit && !shortInProfit)
+   {
+      CommitToPosition(POSITION_TYPE_BUY);
+   }
+   else if(shortInProfit && !longInProfit)
+   {
+      CommitToPosition(POSITION_TYPE_SELL);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Commit to a position based on successful test                    |
+//+------------------------------------------------------------------+
+void CommitToPosition(ENUM_POSITION_TYPE positionType)
+{
+   // Close the losing test position
+   if(positionType == POSITION_TYPE_BUY && testShortTicket != 0)
+   {
+      trade.PositionClose(testShortTicket);
+   }
+   else if(positionType == POSITION_TYPE_SELL && testLongTicket != 0)
+   {
+      trade.PositionClose(testLongTicket);
+   }
+   
+   // Calculate proper position size based on risk
+   double lotSize = CalculateLotSize();
+   
+   // Open committed position
+   MqlTradeRequest request;
+   ZeroMemory(request);
+   MqlTradeResult result;
+   ZeroMemory(result);
+   
+   request.action = TRADE_ACTION_DEAL;
+   request.symbol = _Symbol;
+   request.volume = lotSize;
+   request.type = (positionType == POSITION_TYPE_BUY) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+   request.price = (positionType == POSITION_TYPE_BUY) ? lastTick.ask : lastTick.bid;
+   request.sl = (positionType == POSITION_TYPE_BUY) ? 
+                request.price - (atrValue * TPSLRatio) : 
+                request.price + (atrValue * TPSLRatio);
+   request.tp = (positionType == POSITION_TYPE_BUY) ? 
+               request.price + (atrValue * TPSLRatio * 10) : 
+               request.price - (atrValue * TPSLRatio * 10);
+   request.deviation = 10;
+   request.type_filling = ORDER_FILLING_FOK;
+   request.magic = 12345;
+   
+   if(!OrderSend(request, result))
+   {
+      Print("Error opening committed position: ", GetLastError());
+      return;
+   }
+   
+   if(result.retcode == TRADE_RETCODE_DONE)
+   {
+      committedTicket = result.order;
+      positionOpenTime = TimeCurrent();
+      inTestPhase = false;
+      
+      // Close the winning test position (small one)
+      if(positionType == POSITION_TYPE_BUY && testLongTicket != 0)
+      {
+         trade.PositionClose(testLongTicket);
+      }
+      else if(positionType == POSITION_TYPE_SELL && testShortTicket != 0)
+      {
+         trade.PositionClose(testShortTicket);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Duplicate the winning position                                   |
+//+------------------------------------------------------------------+
+void DuplicatePosition()
+{
+   if(PositionSelectByTicket(committedTicket))
+   {
+      ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      double lotSize = PositionGetDouble(POSITION_VOLUME);
+      double sl = PositionGetDouble(POSITION_SL);
+      double tp = PositionGetDouble(POSITION_TP);
+      
+      MqlTradeRequest request;
+      ZeroMemory(request);
+      MqlTradeResult result;
+      ZeroMemory(result);
+      
+      request.action = TRADE_ACTION_DEAL;
+      request.symbol = _Symbol;
+      request.volume = lotSize;
+      request.type = (posType == POSITION_TYPE_BUY) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+      request.price = (posType == POSITION_TYPE_BUY) ? lastTick.ask : lastTick.bid;
+      request.sl = sl;
+      request.tp = tp;
+      request.deviation = 10;
+      request.type_filling = ORDER_FILLING_FOK;
+      request.magic = 12345;
+      
+      if(!OrderSend(request, result))
+      {
+         Print("Error duplicating position: ", GetLastError());
+         return;
+      }
+      
+      if(result.retcode == TRADE_RETCODE_DONE)
+      {
+         positionOpenTime = TimeCurrent(); // Reset timer for next duplication
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Calculate proper lot size based on risk                          |
+//+------------------------------------------------------------------+
+double CalculateLotSize()
+{
+   double accountBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double riskAmount = accountBalance * (RiskPercent / 100);
+   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double stopLossPoints = atrValue * TPSLRatio / _Point;
+   
+   if(stopLossPoints == 0 || tickValue == 0) return 0.01;
+   
+   double lotSize = (riskAmount / (stopLossPoints * tickValue));
+   lotSize = NormalizeDouble(lotSize, 2);
+   
+   // Ensure lot size is within broker limits
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   
+   lotSize = MathMax(lotSize, minLot);
+   lotSize = MathMin(lotSize, maxLot);
+   lotSize = MathRound(lotSize / lotStep) * lotStep;
+   
+   return lotSize;
+}
+
+//+------------------------------------------------------------------+
+//| Determine if we should enter the market                          |
+//+------------------------------------------------------------------+
+bool ShouldEnterMarket()
+{
+   // Don't enter if we're already in test phase or have committed position
+   if(inTestPhase || (committedTicket != 0 && PositionSelectByTicket(committedTicket)))
+   {
+      return false;
+   }
+   
+   // Check if we've reached max positions
+   if(currentPositions >= MaxPositions)
+   {
+      return false;
+   }
+   
+   // Use regime filter if enabled
+   if(UseRegimeFilter)
+   {
+      // In ranging market, look for overbought/oversold conditions
+      if(trendDirection == 0)
+      {
+         if(rsiValue < RSI_Oversold)
+         {
+            return true;
+         }
+         else if(rsiValue > RSI_Overbought)
+         {
+            return true;
+         }
+      }
+      // In trending market, follow the trend
+      else
+      {
+         if(trendDirection > 0 && macdValue > 0 && macdValue > macdSignal)
+         {
+            return true;
+         }
+         else if(trendDirection < 0 && macdValue < 0 && macdValue < macdSignal)
+         {
+            return true;
+         }
+      }
+   }
+   else
+   {
+      // Always enter if regime filter is disabled
+      return true;
+   }
+   
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Trade function                                                   |
+//+------------------------------------------------------------------+
+void OnTrade()
+{
+   // Recalculate positions when trade occurs
+   currentPositions = PositionsTotal();
+}
+
+//+------------------------------------------------------------------+
+//| TradeTransaction function                                        |
+//+------------------------------------------------------------------+
+void OnTradeTransaction(const MqlTradeTransaction& trans,
+                       const MqlTradeRequest& request,
+                       const MqlTradeResult& result)
+{
+   // Handle position closures
+   if(trans.type == TRADE_TRANSACTION_DEAL_ADD)
+   {
+      if(trans.deal_type == DEAL_TYPE_SELL || trans.deal_type == DEAL_TYPE_BUY)
+      {
+         // Check if this was a test position being closed
+         if(trans.position == testLongTicket || trans.position == testShortTicket)
+         {
+            if(trans.position == testLongTicket) testLongTicket = 0;
+            if(trans.position == testShortTicket) testShortTicket = 0;
+            
+            if(testLongTicket == 0 && testShortTicket == 0)
+            {
+               inTestPhase = false;
+            }
+         }
+      }
+   }
+}
